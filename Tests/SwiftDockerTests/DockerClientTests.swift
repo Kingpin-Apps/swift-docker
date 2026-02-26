@@ -1,10 +1,7 @@
 import Testing
 import Foundation
+import HTTPTypes
 @testable import SwiftDocker
-
-// MARK: - Shared helpers
-
-let dockerSocketPath = "/Users/hadderley/.docker/run/docker.sock"
 
 // MARK: - Tests
 
@@ -16,7 +13,22 @@ let dockerSocketPath = "/Users/hadderley/.docker/run/docker.sock"
 ///   curl --unix-socket $SOCK -X POST http://localhost/v1.53/containers/{id}/wait
 ///   curl --unix-socket $SOCK "http://localhost/v1.53/containers/{id}/logs?stdout=1"
 @Test func runAlpineEchoContainer() async throws {
-    let docker = try Docker(socketPath: dockerSocketPath)
+    let transport = MockTransport()
+
+    await transport.register(operationID: "ContainerCreate") { _, _ in
+        (Fixtures.jsonResponse(status: .created), try Fixtures.containerCreateBody(id: "abc123"))
+    }
+    await transport.register(operationID: "ContainerStart") { _, _ in
+        (Fixtures.noContentResponse(), nil)
+    }
+    await transport.register(operationID: "ContainerWait") { _, _ in
+        (Fixtures.jsonResponse(status: .ok), try Fixtures.containerWaitBody(statusCode: 0))
+    }
+    await transport.register(operationID: "ContainerLogs") { _, _ in
+        (Fixtures.multiplexedStreamResponse(status: .ok), Fixtures.containerLogsBody(message: "hello world\n"))
+    }
+
+    let docker = try Docker.mock(transport: transport)
 
     // 1. Create the container.
     let createResponse = try await docker.client.containerCreate(.init(
@@ -30,25 +42,19 @@ let dockerSocketPath = "/Users/hadderley/.docker/run/docker.sock"
     ))
     let createBody = try createResponse.created.body.json
     let containerID = createBody.id
-    print("Created container: \(containerID)")
-    if !createBody.warnings.isEmpty {
-        print("Warnings: \(createBody.warnings)")
-    }
+    #expect(containerID == "abc123")
+    #expect(createBody.warnings.isEmpty)
 
     // 2. Start the container.
     _ = try await docker.client.containerStart(.init(
         path: .init(id: containerID)
     )).noContent
-    print("Container started.")
 
     // 3. Wait for the container to finish.
-    // `not-running` resolves as soon as the container stops, which is correct
-    // for a container that may already have exited by the time we call wait.
     let waitResult = try await docker.client.containerWait(.init(
         path: .init(id: containerID),
         query: .init(condition: .notRunning)
     )).ok.body.json
-    print("Container exited with status: \(waitResult.statusCode)")
     #expect(waitResult.statusCode == 0)
 
     // 4. Fetch stdout logs.
@@ -58,9 +64,7 @@ let dockerSocketPath = "/Users/hadderley/.docker/run/docker.sock"
     )).ok.body.applicationVnd_docker_multiplexedStream
     let logsData = try await Data(collecting: logsBody, upTo: 1024 * 1024)
 
-    // Use the library's multiplexed-stream decoder to extract plain text.
     let logText = DockerMultiplexedStream.text(from: logsData)
-    print("Container logs: \(logText)")
     #expect(logText.contains("hello world"))
 }
 
@@ -86,90 +90,104 @@ let dockerSocketPath = "/Users/hadderley/.docker/run/docker.sock"
 ///   # Repeat for `echo hello from exec`
 ///   ...
 @Test func dockerExecOnRunningContainer() async throws {
-    let docker = try Docker(socketPath: dockerSocketPath)
+    let transport = MockTransport()
 
-    // 1. Create a container that stays alive long enough for us to exec into.
+    // containerCreate returns the same ID regardless of which container is
+    // being created — tests only care that the ID flows through correctly.
+    await transport.register(operationID: "ContainerCreate") { _, _ in
+        (Fixtures.jsonResponse(status: .created), try Fixtures.containerCreateBody(id: "deadbeef1234"))
+    }
+    await transport.register(operationID: "ContainerStart") { _, _ in
+        (Fixtures.noContentResponse(), nil)
+    }
+    // containerExec issues unique IDs for the two exec instances.
+    let execIDs = ["execid-ls", "execid-echo"]
+    let execIDCounter = Counter()
+    await transport.register(operationID: "ContainerExec") { _, _ in
+        let idx = await execIDCounter.next()
+        let id = idx < execIDs.count ? execIDs[idx] : "execid-unknown"
+        return (Fixtures.jsonResponse(status: .created), try Fixtures.containerExecBody(id: id))
+    }
+    await transport.register(operationID: "ExecStart") { _, _ in
+        (HTTPResponse(status: .ok), nil)
+    }
+    // execInspect is polled by waitForExec — always reply "finished, exit 0".
+    await transport.register(operationID: "ExecInspect") { _, _ in
+        (Fixtures.jsonResponse(status: .ok), try Fixtures.execInspectBody(running: false, exitCode: 0))
+    }
+    await transport.register(operationID: "ContainerStop") { _, _ in
+        (Fixtures.noContentResponse(), nil)
+    }
+
+    let docker = try Docker.mock(transport: transport)
+
+    // 1. Create a container.
     let containerID = try await docker.client.containerCreate(.init(
         body: .json(.init(
-            value1: .init(
-                cmd: ["sleep", "30"],
-                image: "alpine"
-            ),
+            value1: .init(cmd: ["sleep", "30"], image: "alpine"),
             value2: .init()
         ))
     )).created.body.json.id
-    print("Created container: \(containerID)")
+    #expect(containerID == "deadbeef1234")
 
     // 2. Start it.
     _ = try await docker.client.containerStart(.init(
         path: .init(id: containerID)
     )).noContent
-    print("Container started.")
 
     // -------------------------------------------------------------------------
     // Exec 1: `ls /`
     // -------------------------------------------------------------------------
 
-    // 3a. Create the exec instance.
     let lsExecID = try await docker.client.containerExec(.init(
         path: .init(id: containerID),
-        body: .json(.init(
-            attachStdout: true,
-            attachStderr: true,
-            cmd: ["ls", "/"]
-        ))
+        body: .json(.init(attachStdout: true, attachStderr: true, cmd: ["ls", "/"]))
     )).created.body.json.id
-    print("Created exec (ls /): \(lsExecID)")
+    #expect(lsExecID == "execid-ls")
 
-    // 3b. Start detached — fire-and-forget; output goes to the exec's stream
-    //     which we read back via execInspect once complete.
     _ = try await docker.client.execStart(.init(
         path: .init(id: lsExecID),
         body: .json(.init(detach: true))
     )).ok
-    print("Exec (ls /) started.")
 
-    // 3c. Wait for it to finish and verify the exit code.
     let lsExitCode = try await docker.waitForExec(id: lsExecID)
-    print("Exec (ls /) exit code: \(lsExitCode)")
     #expect(lsExitCode == 0)
 
     // -------------------------------------------------------------------------
     // Exec 2: `echo hello from exec`
     // -------------------------------------------------------------------------
 
-    // 4a. Create a second exec instance.
     let echoExecID = try await docker.client.containerExec(.init(
         path: .init(id: containerID),
-        body: .json(.init(
-            attachStdout: true,
-            attachStderr: true,
-            cmd: ["echo", "hello from exec"]
-        ))
+        body: .json(.init(attachStdout: true, attachStderr: true, cmd: ["echo", "hello from exec"]))
     )).created.body.json.id
-    print("Created exec (echo): \(echoExecID)")
+    #expect(echoExecID == "execid-echo")
 
-    // 4b. Start detached.
     _ = try await docker.client.execStart(.init(
         path: .init(id: echoExecID),
         body: .json(.init(detach: true))
     )).ok
-    print("Exec (echo) started.")
 
-    // 4c. Wait for it to finish and verify the exit code.
     let echoExitCode = try await docker.waitForExec(id: echoExecID)
-    print("Exec (echo) exit code: \(echoExitCode)")
     #expect(echoExitCode == 0)
 
     // -------------------------------------------------------------------------
-    // Cleanup: stop the container so it doesn't linger.
+    // Cleanup
     // -------------------------------------------------------------------------
 
-    // `containerWait` with `next-exit` will resolve once we kill it.
-    // We fire the wait first (non-awaited), then stop, so the wait
-    // doesn't race. Here we just stop and ignore the wait response.
     _ = try? await docker.client.containerStop(.init(
         path: .init(id: containerID)
     ))
-    print("Container stopped.")
+}
+
+// MARK: - Counter
+
+/// A simple async-safe incrementing counter used to hand out unique IDs
+/// across sequential calls to the same mock handler.
+actor Counter {
+    private var value = 0
+    func next() -> Int {
+        defer { value += 1 }
+        return value
+    }
 }
